@@ -1,0 +1,712 @@
+// Prisma Schema for Donation Page Feature
+// Version: 1.0
+// Database: PostgreSQL (AWS Aurora/RDS)
+//
+// This schema implements the complete data model for donation management,
+// including donors, gifts, recurring plans, campaigns, forms, receipts,
+// tributes, e-cards, and audit logging.
+//
+// Security Considerations:
+// - All PII fields are marked in comments for encryption/redaction
+// - Soft deletes implemented for audit trail preservation
+// - Foreign keys use restrictive cascading rules
+// - Unique constraints prevent data duplication
+// - Indexes optimized for common query patterns
+
+generator client {
+  provider = "prisma-client-js"
+  // Enable full-text search for PostgreSQL
+  previewFeatures = ["fullTextSearch", "fullTextIndex"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+enum UserRole {
+  donor           // Authenticated donor with self-service access
+  org_admin       // Organization admin (create campaigns, forms)
+  finance_admin   // Finance/admin (refunds, adjustments, exports)
+  support_agent   // Support agent (search donors, resend receipts)
+  platform_admin  // Platform admin (system-wide configuration)
+}
+
+enum Currency {
+  USD
+  CAD
+  EUR
+}
+
+enum GiftStatus {
+  pending   // Payment initiated but not confirmed
+  success   // Payment completed successfully
+  failed    // Payment failed or declined
+  refunded  // Payment was refunded
+}
+
+enum RecurringFrequency {
+  monthly
+  quarterly
+  annually
+}
+
+enum RecurringPlanStatus {
+  active    // Currently processing charges
+  paused    // Temporarily suspended, can be resumed
+  cancelled // Permanently cancelled
+}
+
+enum CampaignStatus {
+  draft     // Not yet published
+  active    // Currently accepting donations
+  paused    // Temporarily disabled
+  closed    // Ended, no longer accepting donations
+}
+
+enum PaymentProcessor {
+  stripe
+  adyen
+  paypal
+}
+
+enum TributeType {
+  honour        // In honour of someone
+  memory        // In memory of someone (memorial)
+  celebration   // To celebrate an occasion
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  READ  // For sensitive data access (PII, financial)
+}
+
+enum ConsentType {
+  email_marketing
+  sms_marketing
+  data_processing
+  third_party_sharing
+}
+
+// ============================================================================
+// AUTHENTICATION & AUTHORIZATION (NextAuth.js)
+// ============================================================================
+
+model User {
+  id            String    @id @default(uuid()) @db.Uuid
+
+  // Authentication
+  email         String    @unique @db.VarChar(255)
+  emailVerified DateTime? @db.Timestamptz(3)
+
+  // Profile
+  name          String?   @db.VarChar(200)
+  image         String?   @db.VarChar(500) // Profile image URL
+
+  // Authorization
+  role          UserRole  @default(donor)
+
+  // Link to Donor entity (for donors who authenticate)
+  donorId       String?   @unique @db.Uuid
+  donor         Donor?    @relation(fields: [donorId], references: [id], onDelete: SetNull)
+
+  // Account Lockout & Security
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime? @db.Timestamptz(3)
+  lastLoginAt         DateTime? @db.Timestamptz(3)
+  lastLoginIp         String?   @db.VarChar(45)
+
+  // Timestamps
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime  @updatedAt @db.Timestamptz(3)
+
+  // Relationships (NextAuth)
+  accounts      Account[]
+  sessions      Session[]
+
+  // Indexes
+  @@index([email], name: "idx_user_email")
+  @@index([donorId], name: "idx_user_donor")
+  @@index([role], name: "idx_user_role")
+  @@index([lockedUntil], name: "idx_user_locked")
+
+  @@map("users")
+}
+
+model Account {
+  id                String  @id @default(uuid()) @db.Uuid
+
+  userId            String  @db.Uuid
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type              String  @db.VarChar(50)  // "oauth", "email", etc.
+  provider          String  @db.VarChar(50)  // "google", "github", "email"
+  providerAccountId String  @db.VarChar(255) // Provider's user ID
+
+  // OAuth Tokens
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String? @db.VarChar(50)
+  scope             String? @db.Text
+  id_token          String? @db.Text
+  session_state     String? @db.Text
+
+  // Timestamps
+  createdAt         DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime @updatedAt @db.Timestamptz(3)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId], name: "idx_account_user")
+
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(uuid()) @db.Uuid
+
+  sessionToken String   @unique @db.VarChar(500)
+  userId       String   @db.Uuid
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  expires      DateTime @db.Timestamptz(3)
+
+  // Session Security Context
+  ipAddress    String?  @db.VarChar(45)
+  userAgent    String?  @db.VarChar(500)
+
+  // Timestamps
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([userId], name: "idx_session_user")
+  @@index([sessionToken], name: "idx_session_token")
+  @@index([expires], name: "idx_session_expires")
+
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String   @db.VarChar(255) // Email address or user ID
+  token      String   @unique @db.VarChar(500)
+  expires    DateTime @db.Timestamptz(3)
+
+  @@unique([identifier, token])
+  @@index([expires], name: "idx_verification_expires")
+
+  @@map("verification_tokens")
+}
+
+// ============================================================================
+// DONOR
+// ============================================================================
+
+model Donor {
+  id        String   @id @default(uuid()) @db.Uuid
+
+  // Contact Information (PII - encrypt at rest)
+  emails    String[] // Array of email addresses for deduplication
+  firstName String   @db.VarChar(100)
+  lastName  String   @db.VarChar(100)
+  phone     String?  @db.VarChar(20) // E.164 format recommended
+
+  // Address Information (PII - encrypt at rest)
+  street1   String?  @db.VarChar(200)
+  street2   String?  @db.VarChar(200)
+  city      String?  @db.VarChar(100)
+  state     String?  @db.VarChar(100) // State/Province/Region
+  zip       String?  @db.VarChar(20)  // Postal/ZIP code
+  country   String?  @db.VarChar(2)   // ISO 3166-1 alpha-2 code
+
+  // Consent & Preferences
+  // Structure: [{ type: "email_marketing", granted: true, grantedAt: "2025-01-15T10:00:00Z", source: "donation_form" }]
+  consents  Json     @default("[]") @db.JsonB
+
+  // External System Integration
+  // Structure: [{ system: "salesforce", externalId: "003..." }, { system: "raiser_edge", externalId: "12345" }]
+  externalIds Json   @default("[]") @db.JsonB
+
+  // Preferences & Metadata
+  // Structure: { doNotContact: false, doNotEmail: false, doNotCall: false, preferredLanguage: "en", communicationFrequency: "weekly" }
+  preferences Json   @default("{}") @db.JsonB
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+  deletedAt DateTime? @db.Timestamptz(3) // Soft delete for audit trail
+
+  // Relationships
+  gifts         Gift[]
+  recurringPlans RecurringPlan[]
+  user          User? // Link to authenticated user account
+
+  // Indexes
+  @@index([emails], name: "idx_donor_emails") // Array GIN index for email lookups
+  @@index([lastName, firstName], name: "idx_donor_name")
+  @@index([createdAt], name: "idx_donor_created")
+  @@index([deletedAt], name: "idx_donor_deleted")
+  @@index([phone], name: "idx_donor_phone")
+
+  @@map("donors")
+}
+
+// ============================================================================
+// CAMPAIGN
+// ============================================================================
+
+model Campaign {
+  id          String   @id @default(uuid()) @db.Uuid
+
+  // Campaign Identification
+  slug        String   @unique @db.VarChar(100) // URL-friendly identifier (e.g., "spring-appeal-2025")
+  name        String   @db.VarChar(200)
+  description String?  @db.Text
+
+  // Goals & Metrics
+  targetAmount  Decimal? @db.Decimal(12, 2) // Fundraising goal
+  donorTarget   Int?                         // Target number of donors
+
+  // Timing
+  startDate   DateTime? @db.Timestamptz(3)
+  endDate     DateTime? @db.Timestamptz(3)
+
+  // Configuration
+  status      CampaignStatus @default(draft)
+  themeId     String?        @db.Uuid // Reference to theme configuration (external)
+
+  // Impact Messaging
+  impactMessage String? @db.Text // Displayed on thank-you page
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+  deletedAt DateTime? @db.Timestamptz(3)
+
+  // Relationships
+  forms         Form[]
+  gifts         Gift[]
+  recurringPlans RecurringPlan[]
+
+  // Indexes
+  @@index([slug], name: "idx_campaign_slug")
+  @@index([status], name: "idx_campaign_status")
+  @@index([startDate, endDate], name: "idx_campaign_dates")
+  @@index([createdAt], name: "idx_campaign_created")
+  @@index([deletedAt], name: "idx_campaign_deleted")
+
+  @@map("campaigns")
+}
+
+// ============================================================================
+// FORM
+// ============================================================================
+
+model Form {
+  id         String   @id @default(uuid()) @db.Uuid
+
+  // Campaign Association
+  campaignId String   @db.Uuid
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Restrict)
+
+  // Form Configuration
+  // Structure: { fields: [...], validation: {...}, presetAmounts: [25, 50, 100, 250], customAmountEnabled: true }
+  schemaJSON Json     @db.JsonB
+
+  // A/B Testing & Variants
+  // Structure: [{ variantId: "A", name: "control", weight: 50, schemaJSON: {...} }, { variantId: "B", name: "test", weight: 50, schemaJSON: {...} }]
+  variants   Json     @default("[]") @db.JsonB
+
+  // Versioning
+  version    Int      @default(1)
+
+  // Publishing
+  publishedAt DateTime? @db.Timestamptz(3)
+
+  // Styling Overrides
+  cssOverrides String? @db.Text // Custom CSS for this form
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  // Relationships
+  gifts Gift[]
+
+  // Indexes
+  @@index([campaignId], name: "idx_form_campaign")
+  @@index([publishedAt], name: "idx_form_published")
+  @@index([createdAt], name: "idx_form_created")
+
+  @@map("forms")
+}
+
+// ============================================================================
+// TRIBUTE
+// ============================================================================
+
+model Tribute {
+  id           String      @id @default(uuid()) @db.Uuid
+
+  // Tribute Details
+  type         TributeType
+  honoreeName  String      @db.VarChar(200) // Name of person being honoured/remembered
+  message      String?     @db.Text         // Optional tribute message (max 500 chars enforced in Zod)
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  // Relationships
+  gifts  Gift[]
+  ecards Ecard[]
+
+  // Indexes
+  @@index([type], name: "idx_tribute_type")
+  @@index([createdAt], name: "idx_tribute_created")
+
+  @@map("tributes")
+}
+
+// ============================================================================
+// GIFT
+// ============================================================================
+
+model Gift {
+  id        String   @id @default(uuid()) @db.Uuid
+
+  // Donor Association
+  donorId   String   @db.Uuid
+  donor     Donor    @relation(fields: [donorId], references: [id], onDelete: Restrict)
+
+  // Campaign & Form Attribution
+  campaignId String?  @db.Uuid
+  campaign   Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+
+  formId     String?  @db.Uuid
+  form       Form?    @relation(fields: [formId], references: [id], onDelete: SetNull)
+
+  // Financial Details
+  amount      Decimal  @db.Decimal(12, 2) // Donation amount
+  currency    Currency @default(USD)
+
+  // Fee Coverage
+  donorCoversFee Boolean  @default(false)
+  feeAmount      Decimal? @db.Decimal(12, 2) // Fee amount if donor covers fees
+  processorFee   Decimal? @db.Decimal(12, 2) // Actual processor fee charged
+  netAmount      Decimal  @db.Decimal(12, 2) // Amount after all fees (amount - processorFee + feeAmount)
+
+  // Payment Processing
+  status        GiftStatus        @default(pending)
+  processor     PaymentProcessor
+  processorRef  String?           @db.VarChar(200) // External transaction ID from payment processor
+
+  // Tribute Association
+  tributeId  String?  @db.Uuid
+  tribute    Tribute? @relation(fields: [tributeId], references: [id], onDelete: SetNull)
+
+  // Metadata & Attribution
+  // Structure: { utmSource: "email", utmMedium: "campaign", utmCampaign: "spring2025", ipAddress: "192.0.2.1", userAgent: "..." }
+  metadata   Json     @default("{}") @db.JsonB
+
+  // Timestamps
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  completedAt DateTime? @db.Timestamptz(3) // When payment succeeded
+  refundedAt  DateTime? @db.Timestamptz(3) // When refund processed
+  deletedAt   DateTime? @db.Timestamptz(3) // Soft delete
+
+  // Relationships
+  receipt Receipt?
+
+  // Indexes
+  @@index([donorId], name: "idx_gift_donor")
+  @@index([campaignId], name: "idx_gift_campaign")
+  @@index([formId], name: "idx_gift_form")
+  @@index([status], name: "idx_gift_status")
+  @@index([processor, processorRef], name: "idx_gift_processor_ref")
+  @@index([createdAt], name: "idx_gift_created")
+  @@index([completedAt], name: "idx_gift_completed")
+  @@index([tributeId], name: "idx_gift_tribute")
+  @@index([donorId, status], name: "idx_gift_donor_status") // Composite for donor history queries
+  @@index([campaignId, createdAt], name: "idx_gift_campaign_created") // Composite for campaign reports
+  @@index([deletedAt], name: "idx_gift_deleted")
+
+  @@map("gifts")
+}
+
+// ============================================================================
+// RECURRING PLAN
+// ============================================================================
+
+model RecurringPlan {
+  id         String   @id @default(uuid()) @db.Uuid
+
+  // Donor Association
+  donorId    String   @db.Uuid
+  donor      Donor    @relation(fields: [donorId], references: [id], onDelete: Restrict)
+
+  // Campaign Attribution
+  campaignId String?  @db.Uuid
+  campaign   Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+
+  // Financial Details
+  amount     Decimal            @db.Decimal(12, 2)
+  currency   Currency           @default(USD)
+  frequency  RecurringFrequency @default(monthly)
+
+  // Fee Coverage
+  donorCoversFee Boolean  @default(false)
+  feeAmount      Decimal? @db.Decimal(12, 2) // Fee amount per charge if donor covers fees
+
+  // Status & Scheduling
+  status          RecurringPlanStatus @default(active)
+  nextChargeDate  DateTime            @db.Timestamptz(3)
+  lastChargeDate  DateTime?           @db.Timestamptz(3)
+
+  // Payment Processing
+  processor    PaymentProcessor
+  mandateId    String           @db.VarChar(200) // Processor subscription/mandate ID (Stripe subscription ID, Adyen mandate, etc.)
+
+  // Timestamps
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
+  pausedAt    DateTime? @db.Timestamptz(3)
+  cancelledAt DateTime? @db.Timestamptz(3)
+
+  // Indexes
+  @@index([donorId], name: "idx_recurring_donor")
+  @@index([campaignId], name: "idx_recurring_campaign")
+  @@index([status], name: "idx_recurring_status")
+  @@index([nextChargeDate], name: "idx_recurring_next_charge")
+  @@index([processor, mandateId], name: "idx_recurring_processor_mandate")
+  @@index([donorId, status], name: "idx_recurring_donor_status")
+  @@index([createdAt], name: "idx_recurring_created")
+
+  @@map("recurring_plans")
+}
+
+// ============================================================================
+// RECEIPT
+// ============================================================================
+
+model Receipt {
+  id       String   @id @default(uuid()) @db.Uuid
+
+  // Gift Association (one-to-one)
+  giftId   String   @unique @db.Uuid
+  gift     Gift     @relation(fields: [giftId], references: [id], onDelete: Restrict)
+
+  // Receipt Identification
+  number   String   @unique @db.VarChar(50) // e.g., "RCP-2025-001234"
+
+  // Document URLs
+  pdfUrl   String   @db.VarChar(500) // S3 URL to PDF receipt
+  htmlUrl  String?  @db.VarChar(500) // Optional HTML version URL
+
+  // Tax Information
+  taxDeductibleAmount Decimal @db.Decimal(12, 2) // May differ from gift amount if fees covered
+
+  // Regional Compliance Data
+  // Structure: { country: "US", taxYear: 2025, ein: "12-3456789", charityRegistration: "..." }
+  regionalData Json    @db.JsonB
+
+  // Corrections (if receipt needs to be reissued)
+  correctedFromId String? @db.Uuid
+  correctedFrom   Receipt? @relation("ReceiptCorrection", fields: [correctedFromId], references: [id], onDelete: SetNull)
+  corrections     Receipt[] @relation("ReceiptCorrection")
+
+  // Delivery
+  sentAt    DateTime  @db.Timestamptz(3)
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  // Indexes
+  @@index([giftId], name: "idx_receipt_gift")
+  @@index([number], name: "idx_receipt_number")
+  @@index([sentAt], name: "idx_receipt_sent")
+  @@index([createdAt], name: "idx_receipt_created")
+  @@index([correctedFromId], name: "idx_receipt_corrected_from")
+
+  @@map("receipts")
+}
+
+// ============================================================================
+// ECARD
+// ============================================================================
+
+model Ecard {
+  id        String   @id @default(uuid()) @db.Uuid
+
+  // Tribute & Gift Association
+  tributeId String   @db.Uuid
+  tribute   Tribute  @relation(fields: [tributeId], references: [id], onDelete: Restrict)
+
+  giftId    String   @db.Uuid // Reference to the gift (not a foreign key to avoid circular dependency)
+
+  // Design
+  designId  String   @db.VarChar(100) // Template identifier (e.g., "spring-flowers", "memorial-candle")
+
+  // Recipient (PII - encrypt at rest)
+  recipientName  String  @db.VarChar(200)
+  recipientEmail String  @db.VarChar(200)
+
+  // Message
+  personalMessage String? @db.VarChar(250) // Max 250 chars enforced in Zod
+
+  // Scheduling & Delivery
+  scheduleAt DateTime  @db.Timestamptz(3) // When to send (immediate or future)
+  sentAt     DateTime? @db.Timestamptz(3) // When actually sent
+  openedAt   DateTime? @db.Timestamptz(3) // When recipient opened (tracking pixel)
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  // Indexes
+  @@index([tributeId], name: "idx_ecard_tribute")
+  @@index([giftId], name: "idx_ecard_gift")
+  @@index([scheduleAt], name: "idx_ecard_schedule")
+  @@index([sentAt], name: "idx_ecard_sent")
+  @@index([recipientEmail], name: "idx_ecard_recipient")
+  @@index([createdAt], name: "idx_ecard_created")
+
+  @@map("ecards")
+}
+
+// ============================================================================
+// AUDIT LOG
+// ============================================================================
+
+model Audit {
+  id        String   @id @default(uuid()) @db.Uuid
+
+  // Actor
+  actor     String   @db.VarChar(200) // User ID or "system"
+
+  // Action Details
+  action    AuditAction
+  resource  String   @db.VarChar(200) // Format: "gift:uuid" or "donor:uuid"
+
+  // Change Tracking
+  // Structure: { before: { status: "pending" }, after: { status: "success", completedAt: "2025-01-15T10:00:00Z" } }
+  // IMPORTANT: Exclude PII from diffs (use field redaction)
+  diffs     Json     @default("{}") @db.JsonB
+
+  // Request Context
+  ipAddress String?  @db.VarChar(45) // IPv4 or IPv6
+  userAgent String?  @db.VarChar(500)
+
+  // Timestamp (immutable)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  // Indexes
+  @@index([actor], name: "idx_audit_actor")
+  @@index([action], name: "idx_audit_action")
+  @@index([resource], name: "idx_audit_resource")
+  @@index([createdAt], name: "idx_audit_created")
+  @@index([actor, createdAt], name: "idx_audit_actor_created")
+
+  // Note: No updatedAt or deletedAt - audit logs are immutable and append-only
+
+  @@map("audit_logs")
+}
+
+// ============================================================================
+// WEBHOOK EVENT (for idempotency)
+// ============================================================================
+
+model WebhookEvent {
+  id        String   @id @default(uuid()) @db.Uuid
+
+  // Webhook Identification
+  processor     PaymentProcessor
+  externalId    String           @db.VarChar(200) // Event ID from payment processor (e.g., Stripe event ID)
+  eventType     String           @db.VarChar(100) // Event type (e.g., "payment.succeeded")
+
+  // Payload
+  payload       Json             @db.JsonB // Full webhook payload for debugging
+
+  // Processing Status
+  processed     Boolean          @default(false)
+  processedAt   DateTime?        @db.Timestamptz(3)
+  errorMessage  String?          @db.Text // Error details if processing failed
+  retryCount    Int              @default(0)
+
+  // Timestamps
+  createdAt     DateTime         @default(now()) @db.Timestamptz(3)
+
+  // Unique constraint on processor + externalId for idempotency
+  @@unique([processor, externalId], name: "unique_processor_event")
+
+  // Indexes
+  @@index([processor], name: "idx_webhook_processor")
+  @@index([eventType], name: "idx_webhook_event_type")
+  @@index([processed], name: "idx_webhook_processed")
+  @@index([createdAt], name: "idx_webhook_created")
+  @@index([processor, eventType, processed], name: "idx_webhook_processor_type_status")
+
+  @@map("webhook_events")
+}
+
+// ============================================================================
+// ANALYTICS EVENT
+// ============================================================================
+
+model AnalyticsEvent {
+  id        String   @id @default(uuid()) @db.Uuid
+
+  // Event Identification
+  eventName String   @db.VarChar(100) // e.g., "donation_started", "amount_selected"
+  eventType String   @db.VarChar(50)  // e.g., "funnel", "engagement", "error"
+
+  // Session & User Context
+  sessionId String   @db.Uuid
+  userId    String?  @db.Uuid // Donor ID (if authenticated)
+
+  // Campaign & Form Attribution
+  campaignId String?  @db.Uuid
+  campaignSlug String? @db.VarChar(100)
+  formId     String?  @db.Uuid
+
+  // Financial Context (for donation events)
+  amount      Decimal? @db.Decimal(12, 2)
+  currency    String?  @db.VarChar(3)
+  recurring   Boolean?
+  frequency   String?  @db.VarChar(20)
+
+  // UTM Attribution
+  utmSource   String?  @db.VarChar(200)
+  utmMedium   String?  @db.VarChar(200)
+  utmCampaign String?  @db.VarChar(200)
+  utmTerm     String?  @db.VarChar(200)
+  utmContent  String?  @db.VarChar(200)
+
+  // Event Properties (JSON)
+  // Structure: All event-specific properties (non-PII only)
+  properties  Json     @default("{}") @db.JsonB
+
+  // Request Context
+  ipAddress   String?  @db.VarChar(45)
+  userAgent   String?  @db.VarChar(500)
+  pageUrl     String?  @db.VarChar(2000)
+  referrer    String?  @db.VarChar(2000)
+
+  // Timestamp
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+
+  // Indexes for analytics queries
+  @@index([eventName], name: "idx_analytics_event_name")
+  @@index([sessionId], name: "idx_analytics_session")
+  @@index([userId], name: "idx_analytics_user")
+  @@index([campaignId], name: "idx_analytics_campaign")
+  @@index([createdAt], name: "idx_analytics_created")
+  @@index([eventName, createdAt], name: "idx_analytics_event_created")
+  @@index([campaignId, eventName, createdAt], name: "idx_analytics_campaign_event_created")
+  @@index([sessionId, createdAt], name: "idx_analytics_session_created")
+
+  @@map("analytics_events")
+}
